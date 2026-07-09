@@ -58,7 +58,7 @@ public class SecurityConfig {
     private final UserDetailsService userDetailsService;
     private final ObjectMapper       objectMapper;
 
-    @Value("${app.cors.allowed-origins:http://localhost:3000,http://localhost:5173,https://data-bay-gh.vercel.app}")
+    @Value("${app.cors.allowed-origins:http://localhost:3000,http://localhost:5173,https://data-bay-gh.vercel.app,https://databaygh.shop,https://www.databaygh.shop}")
     private String allowedOrigins;
 
     @Bean
