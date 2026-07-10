@@ -25,7 +25,8 @@ import java.util.UUID;
  *  - Platform dashboard KPIs
  *  - User management (list, activate/deactivate)
  *  - Reseller application review (approve / reject + auto-refund on rejection)
- *  - Payout processing (mark PAID / reject)
+ *  - Payout processing (mark PAID / reject) — now handles BOTH reseller profit
+ *    payouts and affiliate commission payouts, distinguished by Payout.source
  *  - Platform pricing management (public + reseller prices per network/GB)
  *  - All-orders and all-transactions views
  *  - Slug backfill for approved resellers missing a store slug
@@ -39,6 +40,16 @@ import java.util.UUID;
  *    per architecture §3.7 and §9.
  *  - backfillMissingSlugs() added to recover approved profiles with null store_slug
  *    (e.g. approved before slug generation logic existed).
+ *  - getDashboard() now also surfaces totalAffiliateEarningsLiabilityGhc — the
+ *    total unclaimed affiliate commission across all users, kept separate
+ *    from totalWalletLiabilitiesGhc since they're different pots of money.
+ *  - markPayoutPaid() / rejectPayout() now branch on Payout.source:
+ *      RESELLER_PROFIT      → touches ResellerProfile.profitPaidGhc (as before)
+ *      AFFILIATE_COMMISSION → the payout amount was already reserved (deducted
+ *                             from User.affiliateEarningsGhc) at request time
+ *                             in AffiliateService.requestPayout(), so marking
+ *                             PAID does nothing further, and REJECTING must
+ *                             refund the reserved amount back to the affiliate.
  */
 @Slf4j
 @Service
@@ -75,6 +86,11 @@ public class AdminService {
         BigDecimal pendingPayoutsTotal = payoutRepository.sumAmountByStatus(Payout.PayoutStatus.PENDING);
         if (pendingPayoutsTotal == null) pendingPayoutsTotal = BigDecimal.ZERO;
 
+        // Total unclaimed affiliate commission across all users. This is a
+        // SEPARATE liability from walletLiabilities — do not add them together.
+        BigDecimal affiliateEarningsLiability = userRepository.sumAffiliateEarningsGhc();
+        if (affiliateEarningsLiability == null) affiliateEarningsLiability = BigDecimal.ZERO;
+
         log.debug("Admin dashboard fetched: users={} orders={}", totalUsers, totalOrders);
 
         return AdminDashboardResponse.builder()
@@ -86,6 +102,7 @@ public class AdminService {
                 .totalRevenueGhc(totalRevenue)
                 .totalWalletLiabilitiesGhc(walletLiabilities)
                 .totalPendingPayoutsGhc(pendingPayoutsTotal)
+                .totalAffiliateEarningsLiabilityGhc(affiliateEarningsLiability)
                 .build();
     }
 
@@ -269,12 +286,18 @@ public class AdminService {
     /**
      * Mark a payout as PAID.
      *
-     * Architecture §3.7 / §9: reseller profit balance and personal wallet are separate.
-     * When a payout is marked paid, we increment profitPaidGhc on the ResellerProfile
-     * (reducing their available profit balance). The personal wallet is NOT touched.
+     * Behaviour depends on Payout.source:
      *
-     * The reseller's personal wallet is only for their own data purchases (top-ups).
-     * Storefront profit is withdrawn via payout, not via wallet debit.
+     *   RESELLER_PROFIT — architecture §3.7 / §9: reseller profit balance and
+     *   personal wallet are separate. We increment profitPaidGhc on the
+     *   ResellerProfile (reducing their available profit balance). The
+     *   personal wallet is NOT touched. Availability is checked here because
+     *   the reseller flow does not reserve funds at request time.
+     *
+     *   AFFILIATE_COMMISSION — AffiliateService.requestPayout() already
+     *   deducted (reserved) the amount from User.affiliateEarningsGhc at
+     *   request time, so there is nothing further to debit here. We only
+     *   flip the status to PAID.
      */
     @Transactional
     public PayoutResponse markPayoutPaid(UUID adminId, Long payoutId,
@@ -289,21 +312,25 @@ public class AdminService {
 
         User admin = findUserOrThrow(adminId);
 
-        // Increment the paid-out amount on the reseller's profit balance
-        ResellerProfile profile = resellerProfileRepository
-                .findByUser(payout.getReseller())
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "No reseller profile found for payout reseller."));
+        if (payout.getSource() == Payout.PayoutSource.RESELLER_PROFIT) {
+            // Increment the paid-out amount on the reseller's profit balance
+            ResellerProfile profile = resellerProfileRepository
+                    .findByUser(payout.getReseller())
+                    .orElseThrow(() -> new ResourceNotFoundException(
+                            "No reseller profile found for payout reseller."));
 
-        BigDecimal available = profile.getAvailableProfitGhc();
-        if (available.compareTo(payout.getAmount()) < 0) {
-            throw new InsufficientBalanceException(
-                    "Reseller's available profit (GHS " + available
-                            + ") is less than payout amount (GHS " + payout.getAmount() + ").");
+            BigDecimal available = profile.getAvailableProfitGhc();
+            if (available.compareTo(payout.getAmount()) < 0) {
+                throw new InsufficientBalanceException(
+                        "Reseller's available profit (GHS " + available
+                                + ") is less than payout amount (GHS " + payout.getAmount() + ").");
+            }
+
+            profile.setProfitPaidGhc(profile.getProfitPaidGhc().add(payout.getAmount()));
+            resellerProfileRepository.save(profile);
         }
-
-        profile.setProfitPaidGhc(profile.getProfitPaidGhc().add(payout.getAmount()));
-        resellerProfileRepository.save(profile);
+        // AFFILIATE_COMMISSION: amount was already reserved out of
+        // affiliateEarningsGhc at request time — nothing more to debit.
 
         payout.setStatus(Payout.PayoutStatus.PAID);
         payout.setPaidAt(LocalDateTime.now());
@@ -316,14 +343,22 @@ public class AdminService {
                 payout.getReseller().getFullName(),
                 payout.getAmount());
 
-        log.info("Payout PAID: payoutId={} resellerId={} amount={} by adminId={}",
-                payoutId, payout.getReseller().getId(), payout.getAmount(), adminId);
+        log.info("Payout PAID: payoutId={} source={} recipientId={} amount={} by adminId={}",
+                payoutId, payout.getSource(), payout.getReseller().getId(),
+                payout.getAmount(), adminId);
 
         return toPayoutResponse(payout);
     }
 
     /**
-     * Reject a payout request. Does NOT touch profit or wallet balance.
+     * Reject a payout request.
+     *
+     *   RESELLER_PROFIT — no balance mutation needed: the reseller flow never
+     *   reserved the amount at request time, so nothing to give back.
+     *
+     *   AFFILIATE_COMMISSION — the amount WAS reserved (deducted from
+     *   affiliateEarningsGhc) at request time, so rejecting must refund it
+     *   back to the affiliate, or that commission would simply vanish.
      */
     @Transactional
     public PayoutResponse rejectPayout(UUID adminId, Long payoutId,
@@ -333,6 +368,17 @@ public class AdminService {
         if (payout.getStatus() != Payout.PayoutStatus.PENDING) {
             throw new ValidationException(
                     "Payout cannot be rejected. Current status: " + payout.getStatus());
+        }
+
+        if (payout.getSource() == Payout.PayoutSource.AFFILIATE_COMMISSION) {
+            User affiliate = payout.getReseller(); // generic recipient field
+            affiliate.setAffiliateEarningsGhc(
+                    affiliate.getAffiliateEarningsGhc().add(payout.getAmount()));
+            userRepository.save(affiliate);
+            log.info("[AFFILIATE] Payout rejected — refunded to earnings balance: " +
+                            "payoutId={} affiliateId={} amount={} newBalance={}",
+                    payoutId, affiliate.getId(), payout.getAmount(),
+                    affiliate.getAffiliateEarningsGhc());
         }
 
         payout.setStatus(Payout.PayoutStatus.REJECTED);
@@ -345,8 +391,9 @@ public class AdminService {
                 payout.getAmount(),
                 request.getReason());
 
-        log.info("Payout REJECTED: payoutId={} resellerId={} by adminId={} reason={}",
-                payoutId, payout.getReseller().getId(), adminId, request.getReason());
+        log.info("Payout REJECTED: payoutId={} source={} recipientId={} by adminId={} reason={}",
+                payoutId, payout.getSource(), payout.getReseller().getId(),
+                adminId, request.getReason());
 
         return toPayoutResponse(payout);
     }

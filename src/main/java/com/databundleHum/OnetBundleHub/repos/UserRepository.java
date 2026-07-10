@@ -49,6 +49,15 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     @Query("SELECT SUM(u.walletBalance) FROM User u")
     BigDecimal sumWalletBalances();
 
+    /**
+     * Sum of affiliateEarningsGhc across all users — the platform's total
+     * outstanding liability for unclaimed affiliate commission. Kept
+     * DELIBERATELY separate from sumWalletBalances(), since these are two
+     * different pots of money owed to users.
+     */
+    @Query("SELECT COALESCE(SUM(u.affiliateEarningsGhc), 0) FROM User u")
+    BigDecimal sumAffiliateEarningsGhc();
+
     // ── Affiliate ─────────────────────────────────────────────────────────────
 
     /**

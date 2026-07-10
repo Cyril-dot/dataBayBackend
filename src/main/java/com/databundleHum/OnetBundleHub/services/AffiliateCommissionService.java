@@ -1,9 +1,8 @@
 package com.databundleHum.OnetBundleHub.services;
 
 import com.databundleHum.OnetBundleHub.entity.*;
-import com.databundleHum.OnetBundleHub.entity.WalletTransaction.TransactionType;
 import com.databundleHum.OnetBundleHub.repos.CommissionTransactionRepository;
-import com.databundleHum.OnetBundleHub.security.InsufficientBalanceException;
+import com.databundleHum.OnetBundleHub.repos.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,13 +14,22 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
 
+/**
+ * Credits/reverses affiliate commission.
+ *
+ * IMPORTANT: commission is credited to User.affiliateEarningsGhc — a
+ * SEPARATE balance from User.walletBalance. It is never mixed with topped-up
+ * wallet funds and never spendable on bundle purchases. Affiliates cash it
+ * out via AffiliateService.requestPayout(), which is the only other place
+ * allowed to mutate affiliateEarningsGhc.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class AffiliateCommissionService {
 
     private final CommissionTransactionRepository commissionTransactionRepository;
-    private final WalletService                   walletService;
+    private final UserRepository                  userRepository;
 
     @Value("${app.affiliate.commission-rate:0.02}")
     private BigDecimal commissionRate;
@@ -39,6 +47,9 @@ public class AffiliateCommissionService {
      *
      * Idempotent: if a CommissionTransaction already exists for this order,
      * the method returns immediately without double-crediting.
+     *
+     * Credits User.affiliateEarningsGhc — NOT the wallet. Affiliate earnings
+     * are a completely separate, payout-only balance.
      *
      * @param order the completed order (status must be VERIFIED at call time)
      */
@@ -89,14 +100,10 @@ public class AffiliateCommissionService {
                 .multiply(commissionRate)
                 .setScale(2, RoundingMode.HALF_UP);
 
-        // Credit the affiliate's wallet
-        walletService.credit(
-                affiliate.getId(),
-                commission,
-                TransactionType.AFFILIATE_COMMISSION,
-                "2% commission on order #" + order.getId(),
-                null
-        );
+        // Credit the affiliate's EARNINGS balance — NOT their wallet.
+        affiliate.setAffiliateEarningsGhc(
+                affiliate.getAffiliateEarningsGhc().add(commission));
+        userRepository.save(affiliate);
 
         // Save the audit record
         CommissionTransaction tx = CommissionTransaction.builder()
@@ -108,8 +115,10 @@ public class AffiliateCommissionService {
                 .build();
         commissionTransactionRepository.save(tx);
 
-        log.info("[COMMISSION] Credited: affiliateId={} buyerId={} orderId={} commission={}",
-                affiliate.getId(), buyer.getId(), order.getId(), commission);
+        log.info("[COMMISSION] Credited to affiliate earnings: affiliateId={} buyerId={} " +
+                        "orderId={} commission={} newEarningsBalance={}",
+                affiliate.getId(), buyer.getId(), order.getId(), commission,
+                affiliate.getAffiliateEarningsGhc());
     }
 
     // ── Commission reversal ───────────────────────────────────────────────────
@@ -120,10 +129,12 @@ public class AffiliateCommissionService {
      * Idempotent: if the CommissionTransaction is already marked reversed, returns
      * immediately without issuing a second debit.
      *
-     * If the affiliate's wallet is insufficient to cover the reversal
-     * (InsufficientBalanceException), the row is flagged with a PENDING_REVERSAL
-     * note and the deficit will be deducted from the next commission credit
-     * (architecture §9 — pending reversal handling).
+     * Debits User.affiliateEarningsGhc — NOT the wallet. If the affiliate has
+     * already cashed out more than this reversal amount via requestPayout()
+     * (so the balance would go negative), the balance is floored at zero and
+     * the shortfall is simply absorbed — there is no wallet-style hard
+     * rejection here since this is an internal ledger adjustment, not a
+     * customer-facing spend.
      *
      * @param order the order being refunded
      */
@@ -146,35 +157,23 @@ public class AffiliateCommissionService {
         BigDecimal commission = tx.getCommissionGhc();
         User affiliate = tx.getAffiliateUser();
 
-        try {
-            walletService.debit(
-                    affiliate.getId(),
-                    commission,
-                    TransactionType.AFFILIATE_COMMISSION_REVERSAL,
-                    "Commission reversal for refunded order #" + order.getId(),
-                    null
-            );
-
-            tx.setReversed(true);
-            tx.setReversedAt(LocalDateTime.now());
-            commissionTransactionRepository.save(tx);
-
-            log.info("[COMMISSION] Reversed: affiliateId={} orderId={} amount={}",
-                    affiliate.getId(), order.getId(), commission);
-
-        } catch (InsufficientBalanceException ex) {
-            // Affiliate has already withdrawn the commission — flag for future deduction
-            log.warn("[COMMISSION] Insufficient balance for reversal — flagging PENDING: " +
-                            "affiliateId={} orderId={} amount={}",
-                    affiliate.getId(), order.getId(), commission);
-
-            // Mark reversed anyway to prevent re-attempt loops; the negative balance
-            // guard in the next processCommission() call will deduct the deficit.
-            // In a production system you would also set a pendingReversal flag and
-            // subtract it from the next credit before crediting the affiliate.
-            tx.setReversed(true);
-            tx.setReversedAt(LocalDateTime.now());
-            commissionTransactionRepository.save(tx);
+        BigDecimal newEarnings = affiliate.getAffiliateEarningsGhc().subtract(commission);
+        if (newEarnings.compareTo(BigDecimal.ZERO) < 0) {
+            log.warn("[COMMISSION] Reversal exceeds current earnings balance — flooring at zero: " +
+                            "affiliateId={} orderId={} commission={} balanceBefore={}",
+                    affiliate.getId(), order.getId(), commission, affiliate.getAffiliateEarningsGhc());
+            newEarnings = BigDecimal.ZERO;
         }
+
+        affiliate.setAffiliateEarningsGhc(newEarnings);
+        userRepository.save(affiliate);
+
+        tx.setReversed(true);
+        tx.setReversedAt(LocalDateTime.now());
+        commissionTransactionRepository.save(tx);
+
+        log.info("[COMMISSION] Reversed from affiliate earnings: affiliateId={} orderId={} " +
+                        "amount={} newEarningsBalance={}",
+                affiliate.getId(), order.getId(), commission, newEarnings);
     }
 }

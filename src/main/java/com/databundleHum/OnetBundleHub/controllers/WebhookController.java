@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.*;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.Map;
@@ -29,6 +30,15 @@ public class WebhookController {
 
     @Value("${paystack.secret-key}")
     private String paystackSecretKey;
+
+    /**
+     * Must match OrderService.PAYSTACK_CHARGE_RATE. Only used as a FALLBACK
+     * to back a base amount out of the raw charged amount if "baseAmountGhc"
+     * is ever missing from metadata — the normal path always uses the
+     * metadata value directly, since that's the exact figure the customer
+     * agreed to top up.
+     */
+    private static final BigDecimal PAYSTACK_CHARGE_RATE = new BigDecimal("0.10");
 
     @PostMapping("/paystack")
     @Operation(summary = "Paystack webhook — charge.success handler")
@@ -97,10 +107,20 @@ public class WebhookController {
                 String userIdStr = (String) meta.get("userId");
                 log.info("[WEBHOOK] userId from metadata: {}", userIdStr);
                 UUID userId = UUID.fromString(userIdStr);
-                BigDecimal amount = extractAmountGhc(data);
-                log.info("[WEBHOOK] Processing WALLET_TOPUP: userId={} amount=GHS{} ref={}", userId, amount, reference);
-                orderService.processTopUpWebhook(userId, amount, reference);
-                log.info("[WEBHOOK] ✅ WALLET_TOPUP credited successfully: userId={} amount=GHS{} ref={}", userId, amount, reference);
+
+                // IMPORTANT: the customer was charged base × 1.10 via Paystack.
+                // We must credit the wallet with the BASE amount (what they
+                // asked to top up), not the raw charged amount — otherwise
+                // they get a free 10% bonus on every top-up.
+                BigDecimal chargedAmountGhc = extractAmountGhc(data);
+                BigDecimal baseAmountGhc = extractBaseAmountGhc(meta, chargedAmountGhc, reference);
+
+                log.info("[WEBHOOK] Processing WALLET_TOPUP: userId={} chargedAmount=GHS{} " +
+                                "creditAmount=GHS{} ref={}",
+                        userId, chargedAmountGhc, baseAmountGhc, reference);
+                orderService.processTopUpWebhook(userId, baseAmountGhc, reference);
+                log.info("[WEBHOOK] ✅ WALLET_TOPUP credited successfully: userId={} amount=GHS{} ref={}",
+                        userId, baseAmountGhc, reference);
 
             } else if ("GUEST_ORDER".equals(type)) {
                 log.info("[WEBHOOK] Processing GUEST_ORDER: ref={}", reference);
@@ -172,6 +192,37 @@ public class WebhookController {
         BigDecimal result = new BigDecimal(raw.toString()).divide(BigDecimal.valueOf(100));
         log.info("[WEBHOOK] Amount converted: {}pesewas → GHS{}", raw, result);
         return result;
+    }
+
+    /**
+     * Reads the ORIGINAL top-up amount the customer requested (before the
+     * 10% Paystack processing charge) from metadata.baseAmountGhc, which
+     * OrderService.initiateTopUp() stashed there at initiation time.
+     *
+     * Falls back to backing it out of the charged amount only if metadata
+     * is somehow missing it — this should never happen in normal operation
+     * and is logged loudly if it does, since it means initiateTopUp()
+     * and this webhook have drifted out of sync.
+     */
+    private BigDecimal extractBaseAmountGhc(Map<String, Object> meta,
+                                            BigDecimal chargedAmountGhc,
+                                            String reference) {
+        Object rawBase = meta != null ? meta.get("baseAmountGhc") : null;
+
+        if (rawBase != null) {
+            try {
+                return new BigDecimal(rawBase.toString()).setScale(2, RoundingMode.HALF_UP);
+            } catch (NumberFormatException ex) {
+                log.error("[WEBHOOK] ❌ Unparseable baseAmountGhc='{}' ref={} — falling back",
+                        rawBase, reference);
+            }
+        } else {
+            log.warn("[WEBHOOK] ⚠️ metadata.baseAmountGhc missing ref={} — falling back to " +
+                    "back-calculating from charged amount", reference);
+        }
+
+        return chargedAmountGhc
+                .divide(BigDecimal.ONE.add(PAYSTACK_CHARGE_RATE), 2, RoundingMode.HALF_UP);
     }
 
     private String toJsonString(Map<String, Object> payload) {

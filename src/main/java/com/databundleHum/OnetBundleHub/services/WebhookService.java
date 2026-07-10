@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.UUID;
 
 /**
@@ -22,11 +23,19 @@ import java.util.UUID;
  *
  * The "metadata.type" field in the Paystack transaction determines which flow to run.
  * This metadata is set during transaction initialisation in OrderService / ResellerService.
+ *
+ * PAYSTACK PROCESSING CHARGE: WALLET_TOPUP transactions are charged the
+ * customer's requested amount × 1.10 (see OrderService.initiateTopUp). The
+ * wallet must only ever be credited the ORIGINAL requested amount, read from
+ * metadata.baseAmountGhc — never the raw amount Paystack reports as paid.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class WebhookService {
+
+    /** Must match OrderService.PAYSTACK_CHARGE_RATE — used only as a fallback. */
+    private static final BigDecimal PAYSTACK_CHARGE_RATE = new BigDecimal("0.10");
 
     private final OrderService   orderService;
     private final UserRepository userRepository;
@@ -61,8 +70,12 @@ public class WebhookService {
                 UUID userId = parseUserId(userIdStr, reference);
                 if (userId == null) return;
 
-                BigDecimal amountGhc = extractAmountGhc(data);
-                orderService.processTopUpWebhook(userId, amountGhc, reference);
+                // Customer was charged base × 1.10. Credit only the base
+                // amount they originally asked to top up.
+                BigDecimal chargedAmountGhc = extractAmountGhc(data);
+                BigDecimal baseAmountGhc    = extractBaseAmountGhc(data, chargedAmountGhc, reference);
+
+                orderService.processTopUpWebhook(userId, baseAmountGhc, reference);
             }
 
             case "GUEST_ORDER" ->
@@ -105,6 +118,30 @@ public class WebhookService {
     private BigDecimal extractAmountGhc(JsonNode data) {
         long pesewas = data.path("amount").asLong(0);
         return BigDecimal.valueOf(pesewas).movePointLeft(2); // pesewas → GHS
+    }
+
+    /**
+     * Reads metadata.baseAmountGhc (the amount the customer originally asked
+     * to top up, before the 10% charge). Falls back to back-calculating from
+     * the charged amount if it's ever missing, with a loud warning — that
+     * should never happen if OrderService.initiateTopUp() is in sync.
+     */
+    private BigDecimal extractBaseAmountGhc(JsonNode data, BigDecimal chargedAmountGhc, String reference) {
+        JsonNode baseNode = data.path("metadata").path("baseAmountGhc");
+        if (!baseNode.isMissingNode() && !baseNode.asText("").isBlank()) {
+            try {
+                return new BigDecimal(baseNode.asText()).setScale(2, RoundingMode.HALF_UP);
+            } catch (NumberFormatException ex) {
+                log.error("Unparseable metadata.baseAmountGhc='{}' ref={} — falling back",
+                        baseNode.asText(), reference);
+            }
+        } else {
+            log.warn("metadata.baseAmountGhc missing ref={} — falling back to back-calculating " +
+                    "from charged amount", reference);
+        }
+
+        return chargedAmountGhc
+                .divide(BigDecimal.ONE.add(PAYSTACK_CHARGE_RATE), 2, RoundingMode.HALF_UP);
     }
 
     private UUID parseUserId(String userIdStr, String reference) {

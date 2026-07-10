@@ -28,7 +28,9 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -67,6 +69,26 @@ import java.util.UUID;
  *
  * This means a slow commission check or a slow upstream API call can never
  * again cause a committed order row to vanish on rollback.
+ *
+ * ── PAYSTACK PROCESSING CHARGE (2026-07-10) ──────────────────────────────────
+ *
+ * A 10% processing charge is now passed on to the paying customer at the
+ * exact moment real money moves through Paystack:
+ *   - Guest checkout (initiateGuestOrder): the guest pays bundle price × 1.10.
+ *   - Wallet top-up (initiateTopUp / webhook / manual verify): the customer
+ *     pays top-up amount × 1.10, but only the ORIGINAL top-up amount is ever
+ *     credited to their wallet.
+ *
+ * Wallet-funded order placement (placeWalletOrder / placeResellerWalletOrder)
+ * is deliberately left untouched — that money already had the 10% collected
+ * from the customer when it entered the wallet via top-up, so charging it
+ * again on spend would double-charge them.
+ *
+ * IMPORTANT: WebhookController must forward the BASE (pre-charge) amount —
+ * read from Paystack metadata key "baseAmountGhc" — into
+ * processTopUpWebhook(), not the raw amount Paystack reports as paid
+ * (which includes the 10% charge). Crediting the raw Paystack amount would
+ * silently give the customer a free 10% top-up.
  */
 @Slf4j
 @Service
@@ -74,6 +96,9 @@ import java.util.UUID;
 public class OrderService {
 
     private static final int DUPLICATE_WINDOW_SECONDS = 30;
+
+    /** 10% processing charge passed on to the customer at the point of payment. */
+    private static final BigDecimal PAYSTACK_CHARGE_RATE = new BigDecimal("0.10");
 
     private final OrderRepository             orderRepository;
     private final UserRepository              userRepository;
@@ -94,28 +119,35 @@ public class OrderService {
         PlatformSettings settings = getActiveSettings(
                 request.getNetwork(), request.getCapacityGb());
 
+        // Base bundle price (tracked on the order for cost/commission purposes).
+        BigDecimal basePriceGhc = settings.getPublicPriceGhc();
+        // What the guest is actually charged via Paystack, including the 10% fee.
+        BigDecimal chargeAmountGhc = addPaystackCharge(basePriceGhc);
+
         String reference  = paystackService.generateReference();
         String guestEmail = "guest@" + appConfig.getAppBaseUrl()
                 .replaceAll("https?://", "");
 
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("type",         "GUEST_ORDER");
+        metadata.put("phone",        request.getPhoneNumber());
+        metadata.put("network",      request.getNetwork().name());
+        metadata.put("capacityGb",   request.getCapacityGb().toString());
+        metadata.put("baseAmountGhc", basePriceGhc.toPlainString());
+
         paystackService.initiateTransaction(
                 guestEmail,
-                settings.getPublicPriceGhc(),
+                chargeAmountGhc,
                 reference,
-                Map.of(
-                        "type",       "GUEST_ORDER",
-                        "phone",      request.getPhoneNumber(),
-                        "network",    request.getNetwork().name(),
-                        "capacityGb", request.getCapacityGb().toString()
-                )
+                metadata
         );
 
         Order order = Order.builder()
                 .phoneNumber(request.getPhoneNumber())
                 .network(request.getNetwork())
                 .capacityGb(request.getCapacityGb())
-                .costPriceGhc(settings.getPublicPriceGhc())
-                .sellingPriceGhc(settings.getPublicPriceGhc())
+                .costPriceGhc(basePriceGhc)
+                .sellingPriceGhc(basePriceGhc)
                 .paymentMethod(Order.PaymentMethod.PAYSTACK)
                 .paystackRef(reference)
                 .status(Order.OrderStatus.PENDING)
@@ -125,14 +157,15 @@ public class OrderService {
                 .build();
         orderRepository.save(order);
 
-        log.info("[ORDER] Guest order initiated: orderId={} ref={} phone={} network={} gb={}",
+        log.info("[ORDER] Guest order initiated: orderId={} ref={} phone={} network={} gb={} " +
+                        "basePrice={} chargeAmount={}",
                 order.getId(), reference, request.getPhoneNumber(),
-                request.getNetwork(), request.getCapacityGb());
+                request.getNetwork(), request.getCapacityGb(), basePriceGhc, chargeAmountGhc);
 
         return InitiateOrderResponse.builder()
                 .paystackReference(reference)
-                .amountGhc(settings.getPublicPriceGhc())
-                .amountPesewas(paystackService.toSmallestUnit(settings.getPublicPriceGhc()))
+                .amountGhc(chargeAmountGhc)
+                .amountPesewas(paystackService.toSmallestUnit(chargeAmountGhc))
                 .email(guestEmail)
                 .phoneNumber(request.getPhoneNumber())
                 .network(request.getNetwork().name())
@@ -207,20 +240,30 @@ public class OrderService {
         User   user      = findUserOrThrow(userId);
         String reference = paystackService.generateReference();
 
+        // The amount that actually lands in the wallet once payment is verified.
+        BigDecimal baseAmountGhc = request.getAmount();
+        // The amount the customer is charged via Paystack, including the 10% fee.
+        BigDecimal chargeAmountGhc = addPaystackCharge(baseAmountGhc);
+
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("type",          "WALLET_TOPUP");
+        metadata.put("userId",        userId.toString());
+        metadata.put("baseAmountGhc", baseAmountGhc.toPlainString());
+
         Map<String, Object> paystackData = paystackService.initiateTransaction(
                 user.getEmail(),
-                request.getAmount(),
+                chargeAmountGhc,
                 reference,
-                Map.of("type", "WALLET_TOPUP", "userId", userId.toString())
+                metadata
         );
 
-        log.info("[ORDER] Wallet top-up initiated: userId={} amount={} ref={}",
-                userId, request.getAmount(), reference);
+        log.info("[ORDER] Wallet top-up initiated: userId={} baseAmount={} chargeAmount={} ref={}",
+                userId, baseAmountGhc, chargeAmountGhc, reference);
 
         return TopUpInitiateResponse.builder()
                 .paystackReference(reference)
-                .amountGhc(request.getAmount())
-                .amountPesewas(paystackService.toSmallestUnit(request.getAmount()))
+                .amountGhc(chargeAmountGhc)
+                .amountPesewas(paystackService.toSmallestUnit(chargeAmountGhc))
                 .email(user.getEmail())
                 .authorizationUrl((String) paystackData.get("authorization_url"))
                 .build();
@@ -228,6 +271,12 @@ public class OrderService {
 
     // ── Wallet top-up: webhook credit ─────────────────────────────────────────
 
+    /**
+     * @param amountGhc MUST be the BASE (pre-charge) top-up amount, read by
+     *                  WebhookController from Paystack metadata key
+     *                  "baseAmountGhc" — NOT the raw amount Paystack reports
+     *                  as paid, which includes the 10% processing charge.
+     */
     @Transactional
     public void processTopUpWebhook(UUID userId, BigDecimal amountGhc, String paystackRef) {
         if (processedRefRepository.existsByReference(paystackRef)) {
@@ -259,11 +308,14 @@ public class OrderService {
                     .build();
         }
 
-        Map<String, Object> txData    = paystackService.verifyTransaction(
+        Map<String, Object> txData         = paystackService.verifyTransaction(
                 request.getPaystackRef());
-        BigDecimal          amountGhc = paystackService.extractAmountGhc(txData);
+        BigDecimal          chargedAmountGhc = paystackService.extractAmountGhc(txData);
+        // Paystack reports the charged amount (base × 1.10) — back out the fee
+        // so the wallet is only credited with the original top-up amount.
+        BigDecimal          baseAmountGhc    = removePaystackCharge(chargedAmountGhc);
 
-        walletService.credit(userId, amountGhc, TransactionType.TOPUP,
+        walletService.credit(userId, baseAmountGhc, TransactionType.TOPUP,
                 "Wallet top-up (manual verify)", request.getPaystackRef());
 
         processedRefRepository.save(ProcessedRef.builder()
@@ -271,8 +323,8 @@ public class OrderService {
                 .eventType("WALLET_TOPUP")
                 .build());
 
-        log.info("[ORDER] Manual top-up verify success: userId={} amount={} ref={}",
-                userId, amountGhc, request.getPaystackRef());
+        log.info("[ORDER] Manual top-up verify success: userId={} chargedAmount={} creditedAmount={} ref={}",
+                userId, chargedAmountGhc, baseAmountGhc, request.getPaystackRef());
 
         return WalletResponse.builder()
                 .userId(userId)
@@ -285,21 +337,14 @@ public class OrderService {
     /**
      * Places a wallet-funded data bundle order for a regular user.
      *
-     * FIX: this method is no longer @Transactional. Each DB write (debit,
-     * order-save, failure-handling) is its own short REQUIRES_NEW
-     * transaction that commits and releases its connection immediately.
-     * bigDreamsService.purchase() and affiliateCommissionService.
-     * processCommission() are called with NO transaction open on this
-     * thread — a slow commission check can no longer roll back the order.
-     */
-    /**
-     * Places a wallet-funded data bundle order for a regular user.
-     *
      * Price resolution: if the user was referred by a reseller
      * (User.referredByReseller), they pay that reseller's custom price for this
      * exact bundle if one exists, falling back to the admin's public price
      * otherwise. Users with no referring reseller always pay the admin's public
      * price. See PricingService.resolvePriceForUser for the shared rule.
+     *
+     * No Paystack processing charge applies here — that 10% was already
+     * collected from the customer when the wallet was topped up.
      *
      * FIX: this method is no longer @Transactional. Each DB write (debit,
      * order-save, failure-handling) is its own short REQUIRES_NEW
@@ -391,6 +436,9 @@ public class OrderService {
 
     /**
      * Places a wallet-funded data bundle order for a reseller (wholesale price).
+     *
+     * No Paystack processing charge applies here — that 10% was already
+     * collected from the reseller when their wallet was topped up.
      *
      * FIX: same pattern as placeWalletOrder — no top-level @Transactional,
      * each DB write is its own short REQUIRES_NEW transaction, and
@@ -553,6 +601,21 @@ public class OrderService {
                 .orElseThrow(() -> new BundleNotFoundException(
                         "Bundle not available: network=" + network
                                 + " capacityGb=" + capacityGb));
+    }
+
+    // ── Paystack charge helpers ──────────────────────────────────────────────
+
+    /** Adds the 10% processing charge on top of a base amount (e.g. 6.00 → 6.60). */
+    private BigDecimal addPaystackCharge(BigDecimal baseAmountGhc) {
+        return baseAmountGhc
+                .multiply(BigDecimal.ONE.add(PAYSTACK_CHARGE_RATE))
+                .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** Reverses the 10% processing charge to recover the base amount (e.g. 6.60 → 6.00). */
+    private BigDecimal removePaystackCharge(BigDecimal chargedAmountGhc) {
+        return chargedAmountGhc
+                .divide(BigDecimal.ONE.add(PAYSTACK_CHARGE_RATE), 2, RoundingMode.HALF_UP);
     }
 
     // ── Mapper ────────────────────────────────────────────────────────────────

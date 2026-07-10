@@ -3,15 +3,20 @@ package com.databundleHum.OnetBundleHub.services;
 import com.databundleHum.OnetBundleHub.dtos.AffiliateActivateResponse;
 import com.databundleHum.OnetBundleHub.dtos.AffiliateCommissionResponse;
 import com.databundleHum.OnetBundleHub.dtos.AffiliateDashboardResponse;
+import com.databundleHum.OnetBundleHub.dtos.PayoutRequest;
+import com.databundleHum.OnetBundleHub.dtos.response.PayoutResponse;
 import com.databundleHum.OnetBundleHub.entity.CommissionTransaction;
 import com.databundleHum.OnetBundleHub.entity.Order;
+import com.databundleHum.OnetBundleHub.entity.Payout;
 import com.databundleHum.OnetBundleHub.entity.ResellerProfile;
 import com.databundleHum.OnetBundleHub.entity.User;
 import com.databundleHum.OnetBundleHub.repos.CommissionTransactionRepository;
+import com.databundleHum.OnetBundleHub.repos.PayoutRepository;
 import com.databundleHum.OnetBundleHub.repos.UserRepository;
 import com.databundleHum.OnetBundleHub.security.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -23,7 +28,7 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 /**
- * Affiliate programme — opt-in/out, code generation, dashboard stats.
+ * Affiliate programme — opt-in/out, code generation, dashboard stats, payouts.
  *
  * Any USER (including resellers) can activate the affiliate programme.
  * No fee, no approval, no expiry. Deactivation is instant and reversible.
@@ -41,6 +46,12 @@ import java.util.UUID;
  *   Enforced at registration in AuthService.register() by checking that
  *   the affiliate code does not resolve to the signing-up user's own ID.
  *   This service does not need to re-check it.
+ *
+ * Payouts:
+ *   Affiliate commission lives in User.affiliateEarningsGhc — a SEPARATE
+ *   balance from User.walletBalance (topped-up/spendable money).
+ *   requestPayout() checks and draws ONLY against affiliateEarningsGhc;
+ *   it never reads or touches walletBalance.
  */
 @Slf4j
 @Service
@@ -53,7 +64,11 @@ public class AffiliateService {
 
     private final UserRepository                  userRepository;
     private final CommissionTransactionRepository commissionTransactionRepository;
+    private final PayoutRepository                payoutRepository;
     private final AppUrlProvider                  appUrlProvider;
+
+    @Value("${app.affiliate.min-payout-ghc:5.00}")
+    private BigDecimal minPayoutGhc;
 
     // ── Activate ──────────────────────────────────────────────────────────────
 
@@ -97,7 +112,8 @@ public class AffiliateService {
      *
      * The affiliateCode is retained in the DB.
      * The /a/{code} redirect handler will return a graceful "inactive" response.
-     * Already-earned commissions are NOT affected.
+     * Already-earned commissions are NOT affected — affiliateEarningsGhc is
+     * untouched by deactivation and remains payable out.
      */
     @Transactional
     public void deactivate(UUID userId) {
@@ -124,7 +140,8 @@ public class AffiliateService {
      *   - Total referred users who have made at least one purchase
      *   - Total commission earned (all time, non-reversed)
      *   - This month's commission
-     *   - Wallet balance (commissions land in the same wallet)
+     *   - Current payout-eligible earnings balance (affiliateEarningsGhc) —
+     *     NOT walletBalance, since affiliate earnings are a separate pot.
      *
      * Only available when user.isAffiliate == true.
      */
@@ -155,7 +172,10 @@ public class AffiliateService {
                 .referredUsersWithOrders(referredUserCount)
                 .totalCommissionEarnedGhc(totalEarned)
                 .thisMonthCommissionGhc(monthEarned)
-                .walletBalanceGhc(user.getWalletBalance())
+                // NOTE: this used to be walletBalanceGhc. Affiliate earnings
+                // are a separate, payout-only balance — surface THAT here,
+                // not the spendable wallet balance.
+                .availableEarningsGhc(user.getAffiliateEarningsGhc())
                 .build();
     }
 
@@ -174,6 +194,67 @@ public class AffiliateService {
         return commissionTransactionRepository
                 .findByAffiliateUserOrderByCreatedAtDesc(user, pageable)
                 .map(this::toCommissionResponse);
+    }
+
+    // ── Payouts ───────────────────────────────────────────────────────────────
+
+    /**
+     * Request a cash-out of affiliate commission earnings.
+     *
+     * Checked and drawn ONLY against User.affiliateEarningsGhc — this method
+     * never reads or debits walletBalance. Topped-up wallet money can never
+     * be paid out this way.
+     *
+     * The requested amount is reserved immediately (deducted from
+     * affiliateEarningsGhc on request, not on admin approval), so an
+     * affiliate cannot request more than their available balance twice
+     * before the first request is processed.
+     */
+    @Transactional
+    public PayoutResponse requestPayout(UUID userId, PayoutRequest request) {
+        User user = findActiveAffiliateOrThrow(userId);
+
+        if (request.getAmount().compareTo(minPayoutGhc) < 0) {
+            throw new MinPayoutNotMetException(
+                    "Minimum payout is GHS " + minPayoutGhc
+                            + ". Requested: GHS " + request.getAmount());
+        }
+
+        BigDecimal available = user.getAffiliateEarningsGhc();
+        if (available.compareTo(request.getAmount()) < 0) {
+            throw new InsufficientBalanceException(
+                    "Available affiliate earnings GHS " + available
+                            + " is insufficient for payout of GHS " + request.getAmount());
+        }
+
+        // Reserve the requested amount immediately — never touches walletBalance.
+        user.setAffiliateEarningsGhc(available.subtract(request.getAmount()));
+        userRepository.save(user);
+
+        Payout payout = Payout.builder()
+                .reseller(user) // generic "recipient" field — see Payout.source for context
+                .amount(request.getAmount())
+                .mobileMoneyNumber(request.getMobileMoneyNumber())
+                .network(request.getNetwork())
+                .status(Payout.PayoutStatus.PENDING)
+                .source(Payout.PayoutSource.AFFILIATE_COMMISSION)
+                .build();
+
+        payout = payoutRepository.save(payout);
+        log.info("[AFFILIATE] Payout requested: userId={} amount={} payoutId={} " +
+                        "earningsBalanceAfter={}",
+                userId, request.getAmount(), payout.getId(), user.getAffiliateEarningsGhc());
+
+        return toPayoutResponse(payout);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<PayoutResponse> getPayoutHistory(UUID userId, Pageable pageable) {
+        User user = findActiveAffiliateOrThrow(userId);
+        return payoutRepository
+                .findByResellerAndSourceOrderByCreatedAtDesc(
+                        user, Payout.PayoutSource.AFFILIATE_COMMISSION, pageable)
+                .map(this::toPayoutResponse);
     }
 
     // ── Cookie-based referral resolution (called from AuthService) ────────────
@@ -267,7 +348,7 @@ public class AffiliateService {
         return candidate;
     }
 
-    // ── Mapper ────────────────────────────────────────────────────────────────
+    // ── Mappers ───────────────────────────────────────────────────────────────
 
     private AffiliateCommissionResponse toCommissionResponse(CommissionTransaction ct) {
         Order order = ct.getOrder();
@@ -281,6 +362,19 @@ public class AffiliateService {
                 .reversed(ct.isReversed())
                 .reversedAt(ct.getReversedAt())
                 .createdAt(ct.getCreatedAt())
+                .build();
+    }
+
+    private PayoutResponse toPayoutResponse(Payout p) {
+        return PayoutResponse.builder()
+                .id(p.getId())
+                .amount(p.getAmount())
+                .mobileMoneyNumber(p.getMobileMoneyNumber())
+                .network(p.getNetwork().name())
+                .status(p.getStatus().name())
+                .adminNote(p.getAdminNote())
+                .paidAt(p.getPaidAt())
+                .createdAt(p.getCreatedAt())
                 .build();
     }
 

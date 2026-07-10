@@ -19,6 +19,12 @@ import java.util.UUID;
  *   referred_by_affiliate_id — FK to the affiliate whose link brought this user in.
  *   referred_by_reseller_id  — FK to the reseller whose /ref/{slug} link brought this
  *                              user in (for sub-customer dashboard tracking).
+ *   affiliate_earnings_ghc   — running balance of commission earned by this user as an
+ *                              affiliate. COMPLETELY SEPARATE from wallet_balance — this
+ *                              is payout-only money, never spendable on bundle purchases
+ *                              and never touched by wallet top-ups or debits. Only
+ *                              AffiliateCommissionService and AffiliateService.requestPayout()
+ *                              are allowed to mutate it.
  *
  * Flyway migration: V_next__add_affiliate_system.sql
  *
@@ -27,6 +33,11 @@ import java.util.UUID;
  *     ADD COLUMN IF NOT EXISTS affiliate_code            VARCHAR(16) UNIQUE,
  *     ADD COLUMN IF NOT EXISTS referred_by_affiliate_id  UUID        REFERENCES users(id),
  *     ADD COLUMN IF NOT EXISTS referred_by_reseller_id   UUID        REFERENCES users(id);
+ *
+ * Flyway migration: V_next__add_affiliate_earnings.sql
+ *
+ *   ALTER TABLE users
+ *     ADD COLUMN IF NOT EXISTS affiliate_earnings_ghc    NUMERIC(12,2) NOT NULL DEFAULT 0;
  */
 @Entity
 @Table(name = "users")
@@ -90,6 +101,20 @@ public class User {
      */
     @Column(name = "affiliate_code", length = 16, unique = true)
     private String affiliateCode;
+
+    /**
+     * Running balance of commission earned as an affiliate. This is a
+     * SEPARATE pot of money from walletBalance:
+     *   - Credited only by AffiliateCommissionService.processCommission()
+     *   - Debited only by AffiliateCommissionService.reverseCommission()
+     *     and AffiliateService.requestPayout()
+     *   - Never spendable on bundle purchases, never affected by wallet
+     *     top-ups or wallet debits.
+     * Payouts are cash-out requests against THIS balance, not walletBalance.
+     */
+    @Column(name = "affiliate_earnings_ghc", nullable = false, precision = 12, scale = 2)
+    @Builder.Default
+    private BigDecimal affiliateEarningsGhc = BigDecimal.ZERO;
 
     /**
      * FK to the affiliate user who referred this user at signup.
