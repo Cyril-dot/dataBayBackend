@@ -19,7 +19,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class AppUrlProvider {
 
-    @Value("${app.base-url:https://www.databaygh.shop")
+    @Value("${app.base-url:https://www.databaygh.shop}")
     private String baseUrl;
 
     /**
