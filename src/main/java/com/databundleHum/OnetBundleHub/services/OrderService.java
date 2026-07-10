@@ -89,6 +89,18 @@ import java.util.UUID;
  * processTopUpWebhook(), not the raw amount Paystack reports as paid
  * (which includes the 10% charge). Crediting the raw Paystack amount would
  * silently give the customer a free 10% top-up.
+ *
+ * ── MISSING authorizationUrl FIX (2026-07-10) ────────────────────────────────
+ *
+ * initiateGuestOrder() was calling paystackService.initiateTransaction(...)
+ * and discarding the return value entirely, so InitiateOrderResponse never
+ * carried the Paystack authorization_url back to the frontend. The frontend
+ * had nothing to redirect the guest to for payment approval, even though an
+ * Order row was already saved as PENDING. The webhook path was never the
+ * issue — fulfilPaystackOrder() only runs on a verified charge.success event,
+ * so nothing was ever provisioned without a real payment. The fix below
+ * mirrors initiateTopUp(): capture the Paystack init response and populate
+ * authorizationUrl on InitiateOrderResponse.
  */
 @Slf4j
 @Service
@@ -135,7 +147,10 @@ public class OrderService {
         metadata.put("capacityGb",   request.getCapacityGb().toString());
         metadata.put("baseAmountGhc", basePriceGhc.toPlainString());
 
-        paystackService.initiateTransaction(
+        // FIX: capture the Paystack init response so we can return the
+        // authorization_url — without it the frontend has nothing to
+        // redirect the customer to for approval/payment.
+        Map<String, Object> paystackData = paystackService.initiateTransaction(
                 guestEmail,
                 chargeAmountGhc,
                 reference,
@@ -164,6 +179,7 @@ public class OrderService {
 
         return InitiateOrderResponse.builder()
                 .paystackReference(reference)
+                .authorizationUrl((String) paystackData.get("authorization_url"))
                 .amountGhc(chargeAmountGhc)
                 .amountPesewas(paystackService.toSmallestUnit(chargeAmountGhc))
                 .email(guestEmail)

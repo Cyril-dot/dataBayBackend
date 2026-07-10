@@ -1,6 +1,7 @@
 package com.databundleHum.OnetBundleHub.controllers;
 
 import com.databundleHum.OnetBundleHub.services.OrderService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -28,6 +29,8 @@ public class WebhookController {
 
     private final OrderService orderService;
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     @Value("${paystack.secret-key}")
     private String paystackSecretKey;
 
@@ -40,21 +43,40 @@ public class WebhookController {
      */
     private static final BigDecimal PAYSTACK_CHARGE_RATE = new BigDecimal("0.10");
 
+    /**
+     * ── RAW-BODY SIGNATURE FIX (2026-07-10) ────────────────────────────────
+     *
+     * Previously this endpoint took @RequestBody Map<String,Object> payload
+     * and isValidSignature() re-serialized that Map back into JSON via
+     * Jackson to compute the HMAC. That re-serialization is NOT guaranteed
+     * to byte-for-byte match what Paystack originally sent and signed:
+     * Jackson can reorder object keys, reformat numbers (e.g. trailing
+     * zeros, scientific notation), or otherwise normalize whitespace/escapes
+     * differently than Paystack's JSON serializer did. Any of that silently
+     * breaks the HMAC comparison and causes 100% legitimate webhooks to fail
+     * signature validation and get a 401 — not a security hole, but a
+     * reliability one (Paystack will retry, but real events can be delayed
+     * or, if retries are exhausted, dropped).
+     *
+     * THE FIX: accept the raw request body as a String and HMAC that exact
+     * byte sequence — precisely what Paystack signed — then parse it into a
+     * Map only afterward, for the rest of the routing/processing logic.
+     */
     @PostMapping("/paystack")
     @Operation(summary = "Paystack webhook — charge.success handler")
     public ResponseEntity<Void> handlePaystack(
             @RequestHeader(value = "x-paystack-signature", required = false) String signature,
-            @RequestBody Map<String, Object> payload) {
+            @RequestBody String rawBody) {
 
         // ── STEP 1: Log that we received anything at all ──────────────────────
         log.info("[WEBHOOK] ✅ Request received at /api/webhooks/paystack");
         log.info("[WEBHOOK] Signature header present: {}", signature != null ? "YES (length=" + signature.length() + ")" : "NO - NULL");
-        log.info("[WEBHOOK] Raw payload keys: {}", payload.keySet());
+        log.info("[WEBHOOK] Raw body length: {} chars", rawBody != null ? rawBody.length() : 0);
         log.info("[WEBHOOK] Secret key prefix being used: {}", paystackSecretKey != null ? paystackSecretKey.substring(0, Math.min(12, paystackSecretKey.length())) + "..." : "NULL");
 
-        // ── STEP 2: Signature validation ──────────────────────────────────────
+        // ── STEP 2: Signature validation — hash the RAW bytes Paystack sent ────
         log.info("[WEBHOOK] Starting signature validation...");
-        boolean signatureValid = isValidSignature(payload, signature);
+        boolean signatureValid = isValidSignature(rawBody, signature);
         log.info("[WEBHOOK] Signature valid: {}", signatureValid);
 
         if (!signatureValid) {
@@ -65,7 +87,15 @@ public class WebhookController {
 
         log.info("[WEBHOOK] ✅ Signature validation passed");
 
-        // ── STEP 3: Extract event type ────────────────────────────────────────
+        // ── STEP 3: Parse the body now that the signature is verified ─────────
+        Map<String, Object> payload = parsePayload(rawBody);
+        if (payload == null) {
+            log.warn("[WEBHOOK] ❌ Body was not valid JSON — returning 400");
+            return ResponseEntity.badRequest().build();
+        }
+        log.info("[WEBHOOK] Raw payload keys: {}", payload.keySet());
+
+        // ── STEP 4: Extract event type ────────────────────────────────────────
         String event = (String) payload.get("event");
         log.info("[WEBHOOK] Event type: {}", event);
 
@@ -74,7 +104,7 @@ public class WebhookController {
             return ResponseEntity.ok().build();
         }
 
-        // ── STEP 4: Extract data block ────────────────────────────────────────
+        // ── STEP 5: Extract data block ────────────────────────────────────────
         Map<String, Object> data = extractData(payload);
         if (data == null) {
             log.warn("[WEBHOOK] ❌ 'data' field missing from payload — returning 400");
@@ -82,7 +112,7 @@ public class WebhookController {
         }
         log.info("[WEBHOOK] Data block keys: {}", data.keySet());
 
-        // ── STEP 5: Extract reference ─────────────────────────────────────────
+        // ── STEP 6: Extract reference ─────────────────────────────────────────
         String reference = (String) data.get("reference");
         log.info("[WEBHOOK] Reference: {}", reference);
         if (reference == null || reference.isBlank()) {
@@ -90,17 +120,17 @@ public class WebhookController {
             return ResponseEntity.badRequest().build();
         }
 
-        // ── STEP 6: Extract metadata ──────────────────────────────────────────
+        // ── STEP 7: Extract metadata ──────────────────────────────────────────
         Map<String, Object> meta = extractMeta(data);
         log.info("[WEBHOOK] Metadata present: {}", meta != null ? "YES, keys=" + meta.keySet() : "NO - NULL");
         String type = meta != null ? (String) meta.get("type") : null;
         log.info("[WEBHOOK] Transaction type from metadata: {}", type);
 
-        // ── STEP 7: Extract amount ────────────────────────────────────────────
+        // ── STEP 8: Extract amount ────────────────────────────────────────────
         Object rawAmount = data.get("amount");
         log.info("[WEBHOOK] Raw amount from Paystack: {}", rawAmount);
 
-        // ── STEP 8: Route and process ─────────────────────────────────────────
+        // ── STEP 9: Route and process ─────────────────────────────────────────
         log.info("[WEBHOOK] Routing: ref={} type={}", reference, type);
         try {
             if ("WALLET_TOPUP".equals(type)) {
@@ -141,9 +171,18 @@ public class WebhookController {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    private boolean isValidSignature(Map<String, Object> payload, String signature) {
+    /**
+     * Hashes the EXACT raw request body Paystack sent — no re-serialization,
+     * no Jackson round-trip — so the HMAC is computed over precisely the
+     * bytes Paystack signed.
+     */
+    private boolean isValidSignature(String rawBody, String signature) {
         if (signature == null || signature.isBlank()) {
             log.warn("[WEBHOOK-SIG] ❌ Signature is null or blank");
+            return false;
+        }
+        if (rawBody == null) {
+            log.warn("[WEBHOOK-SIG] ❌ Raw body is null");
             return false;
         }
         try {
@@ -151,11 +190,10 @@ public class WebhookController {
             mac.init(new SecretKeySpec(
                     paystackSecretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
 
-            String body = toJsonString(payload);
-            log.debug("[WEBHOOK-SIG] JSON body used for HMAC (first 200 chars): {}",
-                    body.length() > 200 ? body.substring(0, 200) + "..." : body);
+            log.debug("[WEBHOOK-SIG] Raw body used for HMAC (first 200 chars): {}",
+                    rawBody.length() > 200 ? rawBody.substring(0, 200) + "..." : rawBody);
 
-            byte[] hash = mac.doFinal(body.getBytes(StandardCharsets.UTF_8));
+            byte[] hash = mac.doFinal(rawBody.getBytes(StandardCharsets.UTF_8));
             String computed = HexFormat.of().formatHex(hash);
 
             log.info("[WEBHOOK-SIG] Computed HMAC (first 20 chars): {}...", computed.substring(0, 20));
@@ -168,6 +206,16 @@ public class WebhookController {
         } catch (Exception ex) {
             log.error("[WEBHOOK-SIG] ❌ Exception during signature validation: {}", ex.getMessage(), ex);
             return false;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parsePayload(String rawBody) {
+        try {
+            return MAPPER.readValue(rawBody, Map.class);
+        } catch (Exception ex) {
+            log.error("[WEBHOOK] ❌ Failed to parse raw body as JSON: {}", ex.getMessage(), ex);
+            return null;
         }
     }
 
@@ -223,18 +271,5 @@ public class WebhookController {
 
         return chargedAmountGhc
                 .divide(BigDecimal.ONE.add(PAYSTACK_CHARGE_RATE), 2, RoundingMode.HALF_UP);
-    }
-
-    private String toJsonString(Map<String, Object> payload) {
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper =
-                    new com.fasterxml.jackson.databind.ObjectMapper();
-            String json = mapper.writeValueAsString(payload);
-            log.debug("[WEBHOOK-SIG] Serialized payload length: {} chars", json.length());
-            return json;
-        } catch (Exception ex) {
-            log.warn("[WEBHOOK-SIG] ⚠️ JSON serialisation fallback used: {}", ex.getMessage());
-            return payload.toString();
-        }
     }
 }
