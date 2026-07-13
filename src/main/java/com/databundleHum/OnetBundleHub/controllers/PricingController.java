@@ -49,4 +49,22 @@ public class PricingController {
         log.debug("[PRICING] Effective pricing resolved: userId={} rows={}", userId, response.size());
         return ResponseEntity.ok(response);
     }
+
+    /**
+     * GET /api/v1/pricing/reseller/effective — reseller-only. Lets the
+     * logged-in reseller preview their OWN effective pricing table: their
+     * custom ResellerPricing rows where set, admin public price as fallback
+     * everywhere else — i.e. exactly what a buyer they referred would see.
+     * Each row's isCustomPrice flag tells the reseller's dashboard which
+     * bundles are their own price vs. still on the admin default.
+     */
+    @GetMapping("/reseller/effective")
+    @PreAuthorize("hasRole('RESELLER')")
+    public ResponseEntity<List<PricingResponse>> getResellerPricing() {
+        UUID resellerId = currentUserId();
+        log.debug("[PRICING] Reseller pricing requested: resellerId={}", resellerId);
+        List<PricingResponse> response = pricingService.getPricingForReseller(resellerId);
+        log.debug("[PRICING] Reseller pricing resolved: resellerId={} rows={}", resellerId, response.size());
+        return ResponseEntity.ok(response);
+    }
 }

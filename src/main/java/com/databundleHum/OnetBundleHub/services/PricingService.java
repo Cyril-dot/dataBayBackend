@@ -52,16 +52,51 @@ public class PricingService {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found: " + userId));
 
-        List<PlatformSettings> activeSettings = platformSettingsRepository.findByActiveTrue();
         User referringReseller = user.getReferredByReseller();
 
         if (referringReseller == null) {
             log.debug("[PRICING] userId={} has no referring reseller — admin public pricing", userId);
-            return activeSettings.stream().map(this::toPublicPriceResponse).toList();
+            return getPublicPricing();
         }
 
+        List<PricingResponse> result = buildPricingWithOverrides(referringReseller);
+
+        log.debug("[PRICING] userId={} referredByResellerId={} — {} row(s)",
+                userId, referringReseller.getId(), result.size());
+
+        return result;
+    }
+
+    /**
+     * Lets a reseller preview their own effective pricing table — the exact
+     * pricing a buyer referred by them would see. Bundles the reseller hasn't
+     * custom-priced fall back to the admin's public price, same as any buyer,
+     * but each row is flagged via isCustomPrice so the reseller's dashboard
+     * can distinguish "my price" from "admin fallback" at a glance.
+     */
+    @Transactional(readOnly = true)
+    public List<PricingResponse> getPricingForReseller(UUID resellerId) {
+        User reseller = userRepository.findById(resellerId)
+                .orElseThrow(() -> new ResourceNotFoundException("Reseller not found: " + resellerId));
+
+        List<PricingResponse> result = buildPricingWithOverrides(reseller);
+
+        log.debug("[PRICING] resellerId={} viewing own pricing — {} row(s)",
+                resellerId, result.size());
+
+        return result;
+    }
+
+    /**
+     * Shared builder: every active bundle, priced from `reseller`'s
+     * ResellerPricing rows where one exists, admin public price otherwise.
+     * isCustomPrice reflects which branch was taken for that row.
+     */
+    private List<PricingResponse> buildPricingWithOverrides(User reseller) {
+        List<PlatformSettings> activeSettings = platformSettingsRepository.findByActiveTrue();
+
         Map<String, ResellerPricing> overrides = new HashMap<>();
-        for (ResellerPricing rp : resellerPricingRepository.findByReseller(referringReseller)) {
+        for (ResellerPricing rp : resellerPricingRepository.findByReseller(reseller)) {
             overrides.put(key(rp.getNetwork().name(), rp.getCapacityGb()), rp);
         }
 
@@ -72,15 +107,13 @@ public class PricingService {
 
             result.add(override != null
                     ? PricingResponse.builder()
-                            .network(settings.getNetwork().name())
-                            .capacityGb(settings.getCapacityGb())
-                            .publicPriceGhc(override.getSellingPriceGhc())
-                            .build()
+                    .network(settings.getNetwork().name())
+                    .capacityGb(settings.getCapacityGb())
+                    .publicPriceGhc(override.getSellingPriceGhc())
+                    .isCustomPrice(true)
+                    .build()
                     : toPublicPriceResponse(settings));
         }
-
-        log.debug("[PRICING] userId={} referredByResellerId={} — {} row(s), {} override(s)",
-                userId, referringReseller.getId(), result.size(), overrides.size());
 
         return result;
     }
@@ -90,6 +123,7 @@ public class PricingService {
                 .network(s.getNetwork().name())
                 .capacityGb(s.getCapacityGb())
                 .publicPriceGhc(s.getPublicPriceGhc())
+                .isCustomPrice(false)
                 .build();
     }
 
