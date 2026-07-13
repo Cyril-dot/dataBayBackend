@@ -4,9 +4,11 @@ package com.databundleHum.OnetBundleHub.services;
 import com.databundleHum.OnetBundleHub.dtos.PricingResponse;
 import com.databundleHum.OnetBundleHub.entity.PlatformSettings;
 import com.databundleHum.OnetBundleHub.entity.ResellerPricing;
+import com.databundleHum.OnetBundleHub.entity.ResellerProfile;
 import com.databundleHum.OnetBundleHub.entity.User;
 import com.databundleHum.OnetBundleHub.repos.PlatformSettingsRepository;
 import com.databundleHum.OnetBundleHub.repos.ResellerPricingRepository;
+import com.databundleHum.OnetBundleHub.repos.ResellerProfileRepository;
 import com.databundleHum.OnetBundleHub.repos.UserRepository;
 import com.databundleHum.OnetBundleHub.security.ResourceNotFoundException;
 import lombok.RequiredArgsConstructor;
@@ -25,7 +27,8 @@ import java.util.*;
  * be conflated:
  *
  *   1) "What does a BUYER pay?" (getEffectivePricingForUser / resolvePriceForUser /
- *      getPricingForReseller as a preview of what a referred buyer would see)
+ *      getPricingForReseller / getPricingForResellerBySlug as a preview of
+ *      what a referred buyer would see)
  *        - If User.referredByReseller is set, the buyer sees THAT reseller's
  *          custom ResellerPricing rows wherever set, falling back to the
  *          admin's PUBLIC retail price (PlatformSettings.publicPriceGhc)
@@ -55,6 +58,9 @@ import java.util.*;
  * directly). This service resolves pricing by the BUYER's own account-level
  * referral attribution, so a user referred by reseller X sees X's prices
  * here even on the generic "Buy a bundle" page, not only on X's storefront.
+ * getPricingForResellerBySlug() is the one exception — a slug-based lookup
+ * added here to support storefront pages needing the buyer-facing preview
+ * without already holding a resellerId.
  */
 @Slf4j
 @Service
@@ -64,6 +70,7 @@ public class PricingService {
     private final UserRepository             userRepository;
     private final PlatformSettingsRepository platformSettingsRepository;
     private final ResellerPricingRepository  resellerPricingRepository;
+    private final ResellerProfileRepository  resellerProfileRepository;
 
     // ── Buyer-facing pricing ─────────────────────────────────────────────────
 
@@ -106,6 +113,27 @@ public class PricingService {
 
         log.debug("[PRICING] resellerId={} viewing own storefront-preview pricing — {} row(s)",
                 resellerId, result.size());
+
+        return result;
+    }
+
+    /**
+     * Same as {@link #getPricingForReseller(UUID)} — the effective catalog a
+     * BUYER referred by this reseller would see (custom price where set,
+     * admin PUBLIC price as fallback) — but resolves the reseller by their
+     * public storeSlug instead of an internal userId. Used by the storefront
+     * page (/store/{slug}) before/without a resellerId being known.
+     */
+    @Transactional(readOnly = true)
+    public List<PricingResponse> getPricingForResellerBySlug(String storeSlug) {
+        ResellerProfile profile = resellerProfileRepository.findByStoreSlug(storeSlug)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "No reseller found for storeSlug: " + storeSlug));
+
+        List<PricingResponse> result = buildPricingWithOverrides(profile.getUser(), false);
+
+        log.debug("[PRICING] storeSlug={} resellerId={} — {} row(s)",
+                storeSlug, profile.getUser().getId(), result.size());
 
         return result;
     }

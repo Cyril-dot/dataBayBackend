@@ -41,6 +41,24 @@ public class PricingController {
     }
 
     /**
+     * GET /api/v1/pricing/store/{storeSlug} — no auth required. The
+     * effective pricing table a BUYER visiting this reseller's storefront
+     * would see: the reseller's custom prices where set, admin PUBLIC price
+     * as fallback everywhere else. Safe to expose pre-login for the same
+     * reason /public is — it never reveals wholesale/cost pricing, only
+     * what a buyer would pay. Resolves the reseller by their public
+     * storeSlug rather than requiring a resellerId, since a storefront
+     * visitor only ever has the slug from the URL.
+     */
+    @GetMapping("/store/{storeSlug}")
+    public ResponseEntity<List<PricingResponse>> getPricingByStoreSlug(@PathVariable String storeSlug) {
+        log.debug("[PRICING] Storefront pricing requested: storeSlug={}", storeSlug);
+        List<PricingResponse> response = pricingService.getPricingForResellerBySlug(storeSlug);
+        log.debug("[PRICING] Storefront pricing resolved: storeSlug={} rows={}", storeSlug, response.size());
+        return ResponseEntity.ok(response);
+    }
+
+    /**
      * GET /api/v1/pricing/effective — any authenticated user. What THIS
      * user pays as a BUYER: their referring reseller's custom prices where
      * set, admin PUBLIC price as fallback. Deliberately shared across all
