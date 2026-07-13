@@ -134,6 +134,10 @@ public class SecurityConfig {
                         // ── Paystack webhook ─────────────────────────────────────────
                         .requestMatchers("/api/webhooks/**").permitAll()
 
+                        .requestMatchers(HttpMethod.GET,
+                                "/api/v1/pricing/public",
+                                "/api/v1/pricing/store/**"
+                        ).permitAll()
                         // ── Public storefront ────────────────────────────────────────
                         // Browse (GET) and guest checkout (POST .../orders/guest) are
                         // fully public. Wallet checkout (POST .../orders/wallet) is
