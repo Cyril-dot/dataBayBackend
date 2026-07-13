@@ -40,6 +40,14 @@ public class PricingController {
         return ResponseEntity.ok(pricingService.getPublicPricing());
     }
 
+    /**
+     * GET /api/v1/pricing/effective — any authenticated user. What THIS
+     * user pays as a BUYER: their referring reseller's custom prices where
+     * set, admin PUBLIC price as fallback. Deliberately shared across all
+     * roles (a reseller can also buy as a customer under this same rule),
+     * so this route must NOT be repointed at reseller cost pricing — see
+     * /reseller/cost below for that.
+     */
     @GetMapping("/effective")
     @PreAuthorize("isAuthenticated()")
     public ResponseEntity<List<PricingResponse>> getEffectivePricing() {
@@ -65,6 +73,29 @@ public class PricingController {
         log.debug("[PRICING] Reseller pricing requested: resellerId={}", resellerId);
         List<PricingResponse> response = pricingService.getPricingForReseller(resellerId);
         log.debug("[PRICING] Reseller pricing resolved: resellerId={} rows={}", resellerId, response.size());
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * GET /api/v1/pricing/reseller/cost — reseller-only. What THIS reseller
+     * pays as their own wholesale cost for every active bundle — the floor
+     * their own sellingPriceGhc must sit above when setting prices on
+     * /reseller/effective.
+     *
+     * Distinct from /reseller/effective: that route answers "what would a
+     * buyer I referred see?" (falls back to admin PUBLIC price); this route
+     * answers "what do I pay?" (falls back to admin WHOLESALE reseller
+     * price, or the upstream reseller's price if this reseller was itself
+     * referred). Used by the "Add or update a price" form's cost banner so
+     * the margin check validates against the right number.
+     */
+    @GetMapping("/reseller/cost")
+    @PreAuthorize("hasRole('RESELLER')")
+    public ResponseEntity<List<PricingResponse>> getResellerCostPricing() {
+        UUID resellerId = currentUserId();
+        log.debug("[PRICING] Reseller cost pricing requested: resellerId={}", resellerId);
+        List<PricingResponse> response = pricingService.getCostPricingForReseller(resellerId);
+        log.debug("[PRICING] Reseller cost pricing resolved: resellerId={} rows={}", resellerId, response.size());
         return ResponseEntity.ok(response);
     }
 }
