@@ -26,6 +26,15 @@ import java.util.stream.Collectors;
  *
  * Public endpoint — no authentication required for browsing or guest checkout.
  * Wallet checkout requires the customer to be logged in (standard JWT auth).
+ *
+ * CHANGE: Guest checkout no longer relies on the Paystack inline popup (which
+ * requires exposing the Paystack PUBLIC key to the browser). Instead, we use
+ * Paystack's standard/redirect flow — PaystackService.initiateTransaction()
+ * already calls Paystack's /transaction/initialize endpoint server-side using
+ * the SECRET key, and Paystack's response includes an `authorization_url`.
+ * We now capture that URL and return it on the OrderResponse so the frontend
+ * can simply redirect the browser to it. No Paystack key of any kind is ever
+ * sent to the client.
  */
 @Slf4j
 @Service
@@ -102,6 +111,12 @@ public class ResellerStorefrontService {
 
     /**
      * Initiate a Paystack-backed guest order through a reseller's storefront.
+     *
+     * Uses Paystack's standard/redirect flow: initiateTransaction() calls
+     * Paystack server-side with the secret key and returns (among other
+     * things) an `authorization_url`. That URL is passed back on the
+     * OrderResponse so the frontend can redirect the browser to Paystack's
+     * hosted checkout page — no public/secret key is ever exposed client-side.
      */
     @Transactional
     public OrderResponse initiateGuestStorefrontOrder(String slug,
@@ -119,7 +134,7 @@ public class ResellerStorefrontService {
         String guestEmail = "guest@" + appConfig.getAppBaseUrl()
                 .replaceAll("https?://", "");
 
-        paystackService.initiateTransaction(
+        Map<String, Object> paystackData = paystackService.initiateTransaction(
                 guestEmail,
                 sellingPrice,
                 reference,
@@ -131,6 +146,11 @@ public class ResellerStorefrontService {
                         "resellerProfileId", profile.getId().toString()
                 )
         );
+
+        // Paystack's /transaction/initialize response.data includes both
+        // "authorization_url" (hosted checkout page to redirect the browser
+        // to) and "access_code". We only need the URL for a pure redirect flow.
+        String authorizationUrl = (String) paystackData.get("authorization_url");
 
         Order order = Order.builder()
                 .phoneNumber(request.getPhoneNumber())
@@ -153,7 +173,7 @@ public class ResellerStorefrontService {
                 slug, order.getId(), reference, request.getPhoneNumber(),
                 request.getNetwork(), request.getCapacityGb(), sellingPrice);
 
-        return toOrderResponse(order);
+        return toOrderResponse(order, authorizationUrl);
     }
 
     /**
@@ -291,8 +311,8 @@ public class ResellerStorefrontService {
     }
 
     private ResellerPricing findResellerPricingOrThrow(User reseller,
-                                                        PlatformSettings.Network network,
-                                                        BigDecimal capacityGb) {
+                                                       PlatformSettings.Network network,
+                                                       BigDecimal capacityGb) {
         return resellerPricingRepository
                 .findByResellerAndNetworkAndCapacityGb(reseller, network, capacityGb)
                 .orElseThrow(() -> new BundleNotFoundException(
@@ -315,6 +335,17 @@ public class ResellerStorefrontService {
     }
 
     private OrderResponse toOrderResponse(Order o) {
+        return toOrderResponse(o, null);
+    }
+
+    /**
+     * @param authorizationUrl  Paystack hosted-checkout redirect URL for a
+     *                          freshly-initiated guest order. Null for every
+     *                          other case (wallet orders, webhook lookups,
+     *                          admin views) — those callers should keep using
+     *                          the single-arg overload above.
+     */
+    private OrderResponse toOrderResponse(Order o, String authorizationUrl) {
         return OrderResponse.builder()
                 .id(o.getId())
                 .phoneNumber(o.getPhoneNumber())
@@ -324,6 +355,7 @@ public class ResellerStorefrontService {
                 .sellingPriceGhc(o.getSellingPriceGhc())
                 .paymentMethod(o.getPaymentMethod().name())
                 .paystackRef(o.getPaystackRef())
+                .authorizationUrl(authorizationUrl)
                 .status(o.getStatus().name())
                 .guest(o.isGuest())
                 .createdAt(o.getCreatedAt())
