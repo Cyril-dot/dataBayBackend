@@ -56,4 +56,7 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             Order.OrderStatus excludedStatus,
             LocalDateTime after
     );
+
+    @Query("SELECT SUM(o.costPriceGhc) FROM Order o WHERE o.status = :status")
+    BigDecimal sumCostPriceByStatus(@Param("status") Order.OrderStatus status);
 }

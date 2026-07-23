@@ -23,6 +23,14 @@ import java.time.LocalDateTime;
  *                      Populated only for RESELLER role orders (direct or storefront)
  *                      where the two prices differ. Zero for regular user orders.
  *                      Used on the reseller's order history table.
+ *
+ *  userEmail           (ADMIN VIEW) Email of the account that placed the order.
+ *                      Null for guest orders (guest = true), since guest checkout
+ *                      has no User row — use the synthetic guest email generated
+ *                      at checkout time if you need something to display instead.
+ *                      Added 2026-07-23 so admins can see who placed each order
+ *                      alongside the phone number the bundle was sent to and the
+ *                      data size purchased.
  */
 @Data
 @NoArgsConstructor
@@ -70,6 +78,13 @@ public class OrderResponse {
      * Null when storefrontOrder = false.
      */
     private String     resellerStoreName;
+
+    /**
+     * Email of the account that placed this order. Null for guest orders
+     * (order.getUser() == null). Populated for the admin all-orders view so
+     * admins can see who placed each order.
+     */
+    private String     userEmail;
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

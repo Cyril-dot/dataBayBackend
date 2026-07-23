@@ -50,6 +50,48 @@ import java.util.UUID;
  *                             in AffiliateService.requestPayout(), so marking
  *                             PAID does nothing further, and REJECTING must
  *                             refund the reserved amount back to the affiliate.
+ *
+ * ── REVENUE/PROFIT FIX (2026-07-23) ──────────────────────────────────────────
+ *
+ * getDashboard() previously called:
+ *     orderRepository.sumSellingPriceByStatus(Order.OrderStatus.DELIVERED)
+ *
+ * But nothing in OrderService (guest checkout, user wallet order, reseller
+ * wallet order) ever sets an order's status to DELIVERED — the only statuses
+ * actually reachable are PENDING, VERIFIED, and FAILED (see OrderService:
+ * markPaystackOrderVerified, placeWalletOrder, placeResellerWalletOrder).
+ * DELIVERED is dead code as far as status transitions go, so this query
+ * always summed zero rows and totalRevenueGhc was permanently stuck at 0,
+ * regardless of how many real sales happened.
+ *
+ * THE FIX: revenue/profit are now computed from Order.OrderStatus.VERIFIED,
+ * which is the actual "payment confirmed and bundle provisioning
+ * attempted/succeeded" status used across the codebase. Profit is now also
+ * exposed as (revenue − cost), using the new
+ * orderRepository.sumCostPriceByStatus(...) query. If your Order entity later
+ * grows a true terminal DELIVERED state distinct from VERIFIED, swap the
+ * status constant used below — but as of this fix, VERIFIED is the only
+ * status that correlates with "sale actually happened."
+ *
+ * NOTE: this requires two repository methods on OrderRepository that must
+ * exist (or be added) alongside the existing sumSellingPriceByStatus:
+ *     BigDecimal sumSellingPriceByStatus(Order.OrderStatus status);
+ *     BigDecimal sumCostPriceByStatus(Order.OrderStatus status);
+ * e.g.:
+ *     @Query("SELECT SUM(o.costPriceGhc) FROM Order o WHERE o.status = :status")
+ *     BigDecimal sumCostPriceByStatus(@Param("status") Order.OrderStatus status);
+ *
+ * ── ADMIN ORDER VIEW FIX (2026-07-23) ─────────────────────────────────────────
+ *
+ * toOrderResponse() previously left userEmail, profitGhc, and
+ * resellerStoreName unset even though OrderResponse already had fields for
+ * them. Admins reviewing /admin/orders had no way to see which account
+ * placed an order — only the destination phone number and bundle size.
+ * toOrderResponse() now populates:
+ *   - userEmail: order.getUser().getEmail(), or null for guest orders
+ *   - profitGhc: sellingPriceGhc − costPriceGhc
+ *   - resellerStoreName: populated when the order was placed by a RESELLER
+ *     and a reseller profile with a store name/slug exists for that user
  */
 @Slf4j
 @Service
@@ -66,6 +108,13 @@ public class AdminService {
     private final NotificationService         notificationService;
     private final ResellerServiceImpl         resellerService; // for generateUniqueSlug()
 
+    /**
+     * The status that represents "payment confirmed / sale actually happened"
+     * for revenue and profit reporting purposes. See REVENUE/PROFIT FIX note
+     * above for why this is VERIFIED and not DELIVERED.
+     */
+    private static final Order.OrderStatus REVENUE_STATUS = Order.OrderStatus.VERIFIED;
+
     // ── Dashboard ─────────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
@@ -77,8 +126,21 @@ public class AdminService {
         long totalOrders    = orderRepository.count();
         long pendingPayouts = payoutRepository.countByStatus(Payout.PayoutStatus.PENDING);
 
-        BigDecimal totalRevenue = orderRepository.sumSellingPriceByStatus(Order.OrderStatus.DELIVERED);
+        // FIX: was summing Order.OrderStatus.DELIVERED, a status no order ever
+        // reaches — always returned 0. Now sums VERIFIED, the real
+        // "payment confirmed" status. See class-level REVENUE/PROFIT FIX note.
+        BigDecimal totalRevenue = orderRepository.sumSellingPriceByStatus(REVENUE_STATUS);
         if (totalRevenue == null) totalRevenue = BigDecimal.ZERO;
+
+        // Total cost of goods for the same set of orders, so profit can be derived.
+        BigDecimal totalCost = orderRepository.sumCostPriceByStatus(REVENUE_STATUS);
+        if (totalCost == null) totalCost = BigDecimal.ZERO;
+
+        // Gross profit = revenue − cost. This does NOT subtract affiliate
+        // commissions paid out — those are tracked separately below as a
+        // liability (totalAffiliateEarningsLiabilityGhc), since commission
+        // owed doesn't necessarily mean commission has been cashed out yet.
+        BigDecimal totalProfit = totalRevenue.subtract(totalCost);
 
         BigDecimal walletLiabilities = userRepository.sumWalletBalances();
         if (walletLiabilities == null) walletLiabilities = BigDecimal.ZERO;
@@ -91,7 +153,8 @@ public class AdminService {
         BigDecimal affiliateEarningsLiability = userRepository.sumAffiliateEarningsGhc();
         if (affiliateEarningsLiability == null) affiliateEarningsLiability = BigDecimal.ZERO;
 
-        log.debug("Admin dashboard fetched: users={} orders={}", totalUsers, totalOrders);
+        log.debug("Admin dashboard fetched: users={} orders={} revenue={} cost={} profit={}",
+                totalUsers, totalOrders, totalRevenue, totalCost, totalProfit);
 
         return AdminDashboardResponse.builder()
                 .totalUsers(totalUsers)
@@ -100,6 +163,8 @@ public class AdminService {
                 .totalOrders(totalOrders)
                 .pendingPayouts(pendingPayouts)
                 .totalRevenueGhc(totalRevenue)
+                .totalCostGhc(totalCost)
+                .totalProfitGhc(totalProfit)
                 .totalWalletLiabilitiesGhc(walletLiabilities)
                 .totalPendingPayoutsGhc(pendingPayoutsTotal)
                 .totalAffiliateEarningsLiabilityGhc(affiliateEarningsLiability)
@@ -540,7 +605,38 @@ public class AdminService {
                 .build();
     }
 
+    /**
+     * Admin order-view mapper.
+     *
+     * FIX (2026-07-23): now populates userEmail (who placed the order),
+     * profitGhc (sellingPrice − costPrice), and resellerStoreName (when the
+     * order was placed by a reseller), all of which were previously left
+     * unset even though OrderResponse already had fields for them.
+     */
     private OrderResponse toOrderResponse(Order o) {
+        User orderUser = o.getUser();
+
+        // userEmail: null for guest orders (no User row at all).
+        String userEmail = (orderUser != null) ? orderUser.getEmail() : null;
+
+        // profitGhc: sellingPrice - costPrice. Zero/negative-safe — just a
+        // straight subtraction; guest and regular-user orders will typically
+        // be zero since costPrice == sellingPrice for those flows.
+        BigDecimal profit = (o.getSellingPriceGhc() != null && o.getCostPriceGhc() != null)
+                ? o.getSellingPriceGhc().subtract(o.getCostPriceGhc())
+                : BigDecimal.ZERO;
+
+        // resellerStoreName: only meaningful when the order was placed by a
+        // reseller (direct wallet order or storefront order). Look up their
+        // profile's effective store name; skip the lookup entirely for guest
+        // and regular USER orders to avoid an unnecessary query per row.
+        String resellerStoreName = null;
+        if (orderUser != null && o.getOrderedByRole() == Order.OrderedByRole.RESELLER) {
+            resellerStoreName = resellerProfileRepository.findByUser(orderUser)
+                    .map(ResellerProfile::getEffectiveStoreName)
+                    .orElse(null);
+        }
+
         return OrderResponse.builder()
                 .id(o.getId())
                 .phoneNumber(o.getPhoneNumber())
@@ -548,10 +644,14 @@ public class AdminService {
                 .capacityGb(o.getCapacityGb())
                 .costPriceGhc(o.getCostPriceGhc())
                 .sellingPriceGhc(o.getSellingPriceGhc())
+                .profitGhc(profit)
                 .paymentMethod(o.getPaymentMethod().name())
                 .paystackRef(o.getPaystackRef())
                 .status(o.getStatus().name())
                 .guest(o.isGuest())
+                .storefrontOrder(o.isStorefrontOrder())
+                .resellerStoreName(resellerStoreName)
+                .userEmail(userEmail)
                 .createdAt(o.getCreatedAt())
                 .updatedAt(o.getUpdatedAt())
                 .build();

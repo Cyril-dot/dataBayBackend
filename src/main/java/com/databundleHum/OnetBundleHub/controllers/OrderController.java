@@ -135,13 +135,26 @@ public class OrderController {
 
     // ── Reseller wallet order ─────────────────────────────────────────────────
 
+    // ── Reseller wallet order ─────────────────────────────────────────────────
+
+    /**
+     * FIX (2026-07-23): sellingPrice arrives here as a raw query parameter
+     * from the reseller's own client — nothing stopped it being omitted,
+     * zero, or negative before reaching the service layer. jakarta.validation
+     * annotations can't be applied directly to a @RequestParam the way they
+     * can to a @RequestBody DTO field, so we do an explicit guard here as a
+     * first line of defense. The authoritative check — sellingPrice must not
+     * be below the platform's cost price for this bundle — lives in
+     * OrderService.placeResellerWalletOrder() and cannot be bypassed even if
+     * this controller-level guard were ever removed.
+     */
     @PostMapping("/reseller/wallet")
     @PreAuthorize("hasRole('RESELLER')")
     @SecurityRequirement(name = "bearerAuth")
     @Operation(summary = "Place a bundle order at reseller (wholesale) price")
     @ApiResponses({
             @ApiResponse(responseCode = "201", description = "Reseller order placed"),
-            @ApiResponse(responseCode = "400", description = "Insufficient balance or validation error"),
+            @ApiResponse(responseCode = "400", description = "Insufficient balance, invalid/below-cost selling price, or validation error"),
             @ApiResponse(responseCode = "403", description = "User is not an approved reseller"),
             @ApiResponse(responseCode = "404", description = "Bundle not available")
     })
@@ -150,6 +163,20 @@ public class OrderController {
             @RequestParam(required = false) BigDecimal sellingPrice) {
 
         UUID userId = currentUserId();
+
+        // Controller-level guard: reject non-positive selling prices outright.
+        // This does NOT replace the cost-floor check in OrderService — it
+        // just stops obviously-malformed/malicious values (null omitted is
+        // fine and handled downstream, but zero/negative never is) before
+        // they're even logged as a legitimate attempt.
+        if (sellingPrice != null && sellingPrice.compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("[ORDER] Rejected reseller order at controller level — " +
+                            "non-positive sellingPrice: userId={} sellingPrice={}",
+                    userId, sellingPrice);
+            throw new com.databundleHum.OnetBundleHub.security.ValidationException(
+                    "Selling price must be greater than zero.");
+        }
+
         log.info("[ORDER] Reseller wallet order: userId={} phone={} network={} gb={} sellingPrice={}",
                 userId, request.getPhoneNumber(), request.getNetwork(), request.getCapacityGb(), sellingPrice);
         OrderResponse response = orderService.placeResellerWalletOrder(userId, request, sellingPrice);
