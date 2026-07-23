@@ -31,6 +31,15 @@ import java.time.LocalDateTime;
  *                      Added 2026-07-23 so admins can see who placed each order
  *                      alongside the phone number the bundle was sent to and the
  *                      data size purchased.
+ *
+ *  userPhone           (ADMIN VIEW) Account phone number of the buyer — i.e. the
+ *                      number on their User profile, NOT the destination number
+ *                      the bundle is delivered to (that's `phoneNumber` below).
+ *                      A buyer can order data for a different number than their
+ *                      own (e.g. buying for a friend/family member), so these two
+ *                      numbers are frequently different and both matter to admins
+ *                      reviewing an order. Null for guest orders (no User row).
+ *                      Added 2026-07-23.
  */
 @Data
 @NoArgsConstructor
@@ -39,6 +48,8 @@ import java.time.LocalDateTime;
 public class OrderResponse {
 
     private Long       id;
+
+    /** Destination number the bundle is delivered to — NOT necessarily the buyer's own number. */
     private String     phoneNumber;
 
     /** PlatformSettings.Network.name() — e.g. "MTN", "TELECEL", "AT_PREMIUM" */
@@ -85,6 +96,13 @@ public class OrderResponse {
      * admins can see who placed each order.
      */
     private String     userEmail;
+
+    /**
+     * Account phone number of the buyer (their User.phone) — distinct from
+     * `phoneNumber` above, which is the destination number the bundle is
+     * sent to. Null for guest orders.
+     */
+    private String     userPhone;
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

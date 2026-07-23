@@ -89,6 +89,11 @@ import java.util.UUID;
  * placed an order — only the destination phone number and bundle size.
  * toOrderResponse() now populates:
  *   - userEmail: order.getUser().getEmail(), or null for guest orders
+ *   - userPhone: order.getUser().getPhone(), or null for guest orders — the
+ *     BUYER's own account phone, distinct from o.getPhoneNumber() (the
+ *     destination number the bundle is delivered to). A buyer can order
+ *     data for a number that isn't their own (e.g. topping up a friend or
+ *     family member), so admins need both numbers visible, not just one.
  *   - profitGhc: sellingPriceGhc − costPriceGhc
  *   - resellerStoreName: populated when the order was placed by a RESELLER
  *     and a reseller profile with a store name/slug exists for that user
@@ -609,15 +614,24 @@ public class AdminService {
      * Admin order-view mapper.
      *
      * FIX (2026-07-23): now populates userEmail (who placed the order),
-     * profitGhc (sellingPrice − costPrice), and resellerStoreName (when the
-     * order was placed by a reseller), all of which were previously left
-     * unset even though OrderResponse already had fields for them.
+     * userPhone (the buyer's own account phone — distinct from the
+     * destination number the bundle is sent to), profitGhc (sellingPrice −
+     * costPrice), and resellerStoreName (when the order was placed by a
+     * reseller), all of which were previously left unset even though
+     * OrderResponse already had fields for them.
      */
     private OrderResponse toOrderResponse(Order o) {
         User orderUser = o.getUser();
 
         // userEmail: null for guest orders (no User row at all).
         String userEmail = (orderUser != null) ? orderUser.getEmail() : null;
+
+        // userPhone: the BUYER's own account phone number — distinct from
+        // o.getPhoneNumber() (the destination number the bundle is sent to).
+        // A buyer can order data for a number that isn't their own (e.g.
+        // topping up a friend or family member's phone), so admins need
+        // both numbers visible rather than just the destination number.
+        String userPhone = (orderUser != null) ? orderUser.getPhone() : null;
 
         // profitGhc: sellingPrice - costPrice. Zero/negative-safe — just a
         // straight subtraction; guest and regular-user orders will typically
@@ -652,6 +666,7 @@ public class AdminService {
                 .storefrontOrder(o.isStorefrontOrder())
                 .resellerStoreName(resellerStoreName)
                 .userEmail(userEmail)
+                .userPhone(userPhone)
                 .createdAt(o.getCreatedAt())
                 .updatedAt(o.getUpdatedAt())
                 .build();
